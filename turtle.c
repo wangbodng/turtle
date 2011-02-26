@@ -7,6 +7,10 @@
 #include <sys/syscall.h>
 #include <errno.h>
 #include <glib.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "haildb.h"
 #include "st.h"
 
@@ -95,6 +99,113 @@ static void log_func(const gchar *log_domain,
         (addnewline ? "\n" : ""));
 }
 
+static void *handle_connection(void *arg) {
+    st_netfd_t nfd = (st_netfd_t)arg;
+    ib_err_t status;
+
+    char buf[4*1024];
+    for (;;) {
+        ssize_t nr = st_read(nfd, buf, sizeof(buf), ST_UTIME_NO_TIMEOUT);
+        if (nr <= 0) break;
+        buf[nr] = 0;
+        char **args = g_strsplit_set(buf, " \r\n", -1);
+        if (g_strcmp0("SET", args[0]) == 0) {
+            ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
+            ib_crsr_t crsr = NULL;
+
+            status = ib_cursor_open_table("turtledb/store", trx, &crsr);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_cursor_lock(crsr, IB_LOCK_IX);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            ib_tpl_t tpl = ib_clust_read_tuple_create(crsr);
+            if (tpl == NULL) { goto done; }
+
+            status = ib_col_set_value(tpl, 0, args[1], strlen(args[1]));
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_col_set_value(tpl, 1, args[2], strlen(args[2]));
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_cursor_insert_row(crsr, tpl);
+            if (status == DB_DUPLICATE_KEY) {
+                g_message("dup key, updating");
+            } else if (status != DB_SUCCESS) {
+                handle_ib_error(status);
+                goto done;
+            }
+
+            ib_tuple_delete(tpl);
+
+            status = ib_cursor_close(crsr);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_trx_commit(trx);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+        } else if (g_strcmp0("GET", args[0]) == 0) {
+        }
+        g_strfreev(args);
+        ssize_t nw = st_write(nfd, buf, nr, ST_UTIME_NO_TIMEOUT);
+        if (nw != nr) break;
+    }
+done:
+    g_message("closing client");
+    st_netfd_close(nfd);
+    return NULL;
+}
+
+static void *accept_loop(void *arg) {
+    st_netfd_t server_nfd = (st_netfd_t)arg;
+    st_netfd_t client_nfd;
+    struct sockaddr_in from;
+    int fromlen = sizeof(from);
+
+    for (;;) {
+        client_nfd = st_accept(server_nfd,
+            (struct sockaddr *)&from, &fromlen, ST_UTIME_NO_TIMEOUT);
+        g_message("accepted");
+        if (st_thread_create(handle_connection,
+            (void *)client_nfd, 0, 1024 * 1024) == NULL)
+        {
+            handle_error("st_thread_create");
+        }
+    }
+    return NULL;
+}
+
+static st_thread_t listen_server(void) {
+    int sock;
+    int n;
+    struct sockaddr_in serv_addr;
+
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+        handle_error("socket");
+    }
+
+    n = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&n, sizeof(n)) < 0) {
+        handle_error("setsockopt SO_REUSEADDR");
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(5555);
+    serv_addr.sin_addr.s_addr = inet_addr("0.0.0.0");
+
+    if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        handle_error("bind");
+    }
+
+    if (listen(sock, 10) < 0) {
+        handle_error("listen");
+    }
+
+    st_netfd_t server_nfd = st_netfd_open_socket(sock);
+    return st_thread_create(accept_loop, (void *)server_nfd, 0, 1024 * 1024);
+}
+
 int main(int argc, char *argv[]) {
     sigset_t mask;
     int sfd;
@@ -180,6 +291,8 @@ int main(int argc, char *argv[]) {
         if (sch != NULL) ib_table_schema_delete(sch);
     }
 
+    listen_server();
+
     st_netfd_t sig_nfd = st_netfd_open(sfd);
     if (sig_nfd == NULL) { handle_error("st_netfd_open sig fd"); }
 
@@ -202,6 +315,8 @@ shutdown:
     status = ib_shutdown(IB_SHUTDOWN_NORMAL);
     if (status != DB_SUCCESS) { handle_fatal_ib_error(status); }
 
+    exit(EXIT_SUCCESS);
+    /* TODO: should probably properly exit all state threads */
     st_thread_exit(NULL);
     g_warn_if_reached();
     return EXIT_FAILURE;
