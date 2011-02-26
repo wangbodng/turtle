@@ -145,6 +145,54 @@ static void *handle_connection(void *arg) {
             if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
 
         } else if (g_strcmp0("GET", args[0]) == 0) {
+            ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
+            ib_crsr_t crsr = NULL;
+
+            status = ib_cursor_open_table("turtledb/store", trx, &crsr);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            ib_tpl_t key_tpl = ib_sec_search_tuple_create(crsr);
+            if (key_tpl == NULL) { goto done; }
+
+            status = ib_col_set_value(key_tpl, 0, args[1], strlen(args[1]));
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            int res = 0;
+            status = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
+            //if (res != -1) { g_error("key (%s) not found: %d", args[1], res); goto done; }
+            if (status == DB_SUCCESS) {
+                ib_tpl_t old_tpl = NULL;
+
+                old_tpl = ib_clust_read_tuple_create(crsr);
+                if (old_tpl == NULL) { goto done; }
+
+                status = ib_cursor_read_row(crsr, old_tpl);
+                if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+                ib_ulint_t len = ib_col_get_len(old_tpl, 1);
+                const char *val = ib_col_get_value(old_tpl, 1);
+
+                if (val == NULL) { goto done; }
+                val = strndup(val, len);
+                nr = snprintf(buf, sizeof(buf), "GET %s %s\n", args[1], val);
+                free((char *)val);
+
+                ib_tuple_delete(old_tpl);
+            } else if (status == DB_END_OF_INDEX) {
+                g_warning("key (%s) not found", args[1]);
+            } else {
+                handle_ib_error(status);
+                goto done;
+            }
+
+            ib_tuple_delete(key_tpl);
+
+            status = ib_cursor_close(crsr);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_trx_commit(trx);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
         }
         g_strfreev(args);
         ssize_t nw = st_write(nfd, buf, nr, ST_UTIME_NO_TIMEOUT);
