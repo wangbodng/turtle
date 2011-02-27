@@ -20,6 +20,8 @@
 #undef G_LOG_DOMAIN
 #define G_LOG_DOMAIN CODE_AT
 
+#define min(a, b) ((a) > (b) ? (b) : (a))
+
 #define handle_error(msg) \
     do { \
         char buf[1024]; \
@@ -99,9 +101,178 @@ static void log_func(const gchar *log_domain,
         (addnewline ? "\n" : ""));
 }
 
+static GThreadPool *wpool = NULL;
+static GThreadPool *rpool = NULL;
+
+struct query_s {
+    char *buf;
+    char **args;
+    ssize_t len;
+    int pipe_fd;
+};
+typedef struct query_s query_t;
+
+static void set_func(gpointer data, gpointer user_data) {
+    (void)user_data;
+    ib_err_t status;
+    ssize_t nw;
+    query_t *q = (query_t *)data;
+    char tmp[] = "\0";
+
+
+    ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
+    ib_crsr_t crsr = NULL;
+
+    status = ib_cursor_open_table("turtledb/store", trx, &crsr);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    status = ib_cursor_lock(crsr, IB_LOCK_IX);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    ib_tpl_t tpl = ib_clust_read_tuple_create(crsr);
+    if (tpl == NULL) { goto done; }
+
+    ib_ulint_t klen = strlen(q->args[1]);
+    status = ib_col_set_value(tpl, 0, q->args[1], klen);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    ib_ulint_t vlen = strlen(q->args[2]);
+    status = ib_col_set_value(tpl, 1, q->args[2], vlen);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    status = ib_cursor_insert_row(crsr, tpl);
+    if (status == DB_DUPLICATE_KEY) {
+        g_debug("found dup key, updating...");
+        ib_tpl_t key_tpl = ib_sec_search_tuple_create(crsr);
+        if (key_tpl == NULL) { goto done; }
+
+        status = ib_col_set_value(key_tpl, 0, q->args[1], klen);
+        if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+        int res = 0;
+        status = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
+        ib_tpl_t old_tpl = NULL;
+        ib_tpl_t new_tpl = NULL;
+
+        ib_tuple_delete(key_tpl);
+
+        old_tpl = ib_clust_read_tuple_create(crsr);
+        if (old_tpl == NULL) { goto done; }
+        new_tpl = ib_clust_read_tuple_create(crsr);
+        if (new_tpl == NULL) { goto done; }
+
+        status = ib_cursor_read_row(crsr, old_tpl);
+        if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+        status = ib_tuple_copy(new_tpl, old_tpl);
+        if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+        ib_ulint_t len = ib_col_get_len(old_tpl, 1);
+        const char *val = ib_col_get_value(old_tpl, 1);
+
+        if (vlen != len || memcmp(val, q->args[2], len) != 0) {
+            val = strndup(val, len);
+            g_debug("old val: [%s](%lu) new: [%s](%lu)\n", val, len, q->args[2], vlen);
+            free((char *)val);
+
+            status = ib_col_set_value(new_tpl, 1, q->args[2], vlen);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+            status = ib_cursor_update_row(crsr, old_tpl, new_tpl);
+            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+        } else {
+            g_debug("old == new, not updating");
+        }
+
+        ib_tuple_delete(old_tpl);
+        ib_tuple_delete(new_tpl);
+    } else if (status != DB_SUCCESS) {
+        handle_ib_error(status);
+        goto done;
+    }
+
+    ib_tuple_delete(tpl);
+
+    status = ib_cursor_close(crsr);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    status = ib_trx_commit(trx);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+done:
+    nw = write(q->pipe_fd, tmp, 1);
+    if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+}
+
+static void get_func(gpointer data, gpointer user_data) {
+    (void)user_data;
+    ib_err_t status;
+    ssize_t nw;
+    query_t *q = (query_t *)data;
+    char tmp[] = "\0";
+
+    ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
+    ib_crsr_t crsr = NULL;
+
+    status = ib_cursor_open_table("turtledb/store", trx, &crsr);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    status = ib_cursor_lock(crsr, IB_LOCK_IS);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    ib_tpl_t key_tpl = ib_sec_search_tuple_create(crsr);
+    if (key_tpl == NULL) { goto done; }
+
+    status = ib_col_set_value(key_tpl, 0, q->args[1], strlen(q->args[1]));
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    int res = 0;
+    status = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
+    //if (res != -1) { g_error("key (%s) not found: %d", args[1], res); goto done; }
+    if (status == DB_SUCCESS) {
+        ib_tpl_t old_tpl = NULL;
+
+        old_tpl = ib_clust_read_tuple_create(crsr);
+        if (old_tpl == NULL) { goto done; }
+
+        status = ib_cursor_read_row(crsr, old_tpl);
+        if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+        ib_ulint_t len = ib_col_get_len(old_tpl, 1);
+        const char *val = ib_col_get_value(old_tpl, 1);
+
+        if (val == NULL) { goto done; }
+        val = strndup(val, len);
+        q->len = snprintf(q->buf, 1024, "GET %s %s\n", q->args[1], val);
+        free((char *)val);
+
+        ib_tuple_delete(old_tpl);
+    } else if (status == DB_END_OF_INDEX) {
+        g_warning("key (%s) not found", q->args[1]);
+    } else {
+        handle_ib_error(status);
+        goto done;
+    }
+
+    ib_tuple_delete(key_tpl);
+
+    status = ib_cursor_close(crsr);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+    status = ib_trx_commit(trx);
+    if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
+
+done:
+    nw = write(q->pipe_fd, tmp, 1);
+    if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+}
+
 static void *handle_connection(void *arg) {
     st_netfd_t nfd = (st_netfd_t)arg;
-    ib_err_t status;
+    int pipes[2];
+
+    if (pipe(pipes) < 0) { goto done; }
+    st_netfd_t p_nfd = st_netfd_open(pipes[0]);
 
     char buf[4*1024];
     for (;;) {
@@ -109,94 +280,46 @@ static void *handle_connection(void *arg) {
         if (nr <= 0) break;
         buf[nr] = 0;
         char **args = g_strsplit_set(buf, " \r\n", -1);
+        if (g_strv_length(args) < 2) {
+            g_strfreev(args);
+            goto done;
+        }
+        query_t *q = g_slice_new(query_t);
+        q->buf = buf;
+        q->args = args;
+        q->pipe_fd = pipes[1];
+        q->len = nr;
+
         if (g_strcmp0("SET", args[0]) == 0) {
-            ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
-            ib_crsr_t crsr = NULL;
-
-            status = ib_cursor_open_table("turtledb/store", trx, &crsr);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            status = ib_cursor_lock(crsr, IB_LOCK_IX);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            ib_tpl_t tpl = ib_clust_read_tuple_create(crsr);
-            if (tpl == NULL) { goto done; }
-
-            status = ib_col_set_value(tpl, 0, args[1], strlen(args[1]));
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            status = ib_col_set_value(tpl, 1, args[2], strlen(args[2]));
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            status = ib_cursor_insert_row(crsr, tpl);
-            if (status == DB_DUPLICATE_KEY) {
-                g_message("dup key, updating");
-            } else if (status != DB_SUCCESS) {
-                handle_ib_error(status);
+            if (g_strv_length(q->args) < 3) {
                 goto done;
             }
-
-            ib_tuple_delete(tpl);
-
-            status = ib_cursor_close(crsr);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            status = ib_trx_commit(trx);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-        } else if (g_strcmp0("GET", args[0]) == 0) {
-            ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
-            ib_crsr_t crsr = NULL;
-
-            status = ib_cursor_open_table("turtledb/store", trx, &crsr);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            ib_tpl_t key_tpl = ib_sec_search_tuple_create(crsr);
-            if (key_tpl == NULL) { goto done; }
-
-            status = ib_col_set_value(key_tpl, 0, args[1], strlen(args[1]));
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            int res = 0;
-            status = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
-            //if (res != -1) { g_error("key (%s) not found: %d", args[1], res); goto done; }
-            if (status == DB_SUCCESS) {
-                ib_tpl_t old_tpl = NULL;
-
-                old_tpl = ib_clust_read_tuple_create(crsr);
-                if (old_tpl == NULL) { goto done; }
-
-                status = ib_cursor_read_row(crsr, old_tpl);
-                if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-                ib_ulint_t len = ib_col_get_len(old_tpl, 1);
-                const char *val = ib_col_get_value(old_tpl, 1);
-
-                if (val == NULL) { goto done; }
-                val = strndup(val, len);
-                nr = snprintf(buf, sizeof(buf), "GET %s %s\n", args[1], val);
-                free((char *)val);
-
-                ib_tuple_delete(old_tpl);
-            } else if (status == DB_END_OF_INDEX) {
-                g_warning("key (%s) not found", args[1]);
+            /* TODO check GError */
+            GError *err = NULL;
+            g_thread_pool_push(wpool, q, &err);
+            if (err == NULL) {
+                char tmp[1];
+                ssize_t nr = st_read(p_nfd, tmp, sizeof(tmp), ST_UTIME_NO_TIMEOUT);
+                g_assert(nr == 1);
             } else {
-                handle_ib_error(status);
-                goto done;
+                g_error("error pushing work to thread pool");
             }
-
-            ib_tuple_delete(key_tpl);
-
-            status = ib_cursor_close(crsr);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
-            status = ib_trx_commit(trx);
-            if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
-
+        } else if (g_strcmp0("GET", args[0]) == 0) {
+            /* TODO check GError */
+            GError *err = NULL;
+            g_thread_pool_push(rpool, q, &err);
+            if (err == NULL) {
+                char tmp[1];
+                ssize_t nr = st_read(p_nfd, tmp, sizeof(tmp), ST_UTIME_NO_TIMEOUT);
+                g_assert(nr == 1);
+            } else {
+                g_error("error pushing work to thread pool");
+            }
         }
         g_strfreev(args);
-        ssize_t nw = st_write(nfd, buf, nr, ST_UTIME_NO_TIMEOUT);
-        if (nw != nr) break;
+        ssize_t nw = st_write(nfd, q->buf, q->len, ST_UTIME_NO_TIMEOUT);
+        g_slice_free(query_t, q);
+        if (nw != q->len) break;
     }
 done:
     g_message("closing client");
@@ -338,6 +461,11 @@ int main(int argc, char *argv[]) {
 
         if (sch != NULL) ib_table_schema_delete(sch);
     }
+
+    wpool = g_thread_pool_new(set_func, NULL, 10, FALSE, NULL);
+    if (wpool == NULL) { handle_error("creating thread pool failed"); }
+    rpool = g_thread_pool_new(get_func, NULL, 10, FALSE, NULL);
+    if (rpool == NULL) { handle_error("creating thread pool failed"); }
 
     listen_server();
 
