@@ -112,13 +112,20 @@ struct query_s {
 };
 typedef struct query_s query_t;
 
+static void notify_pipe(query_t *q) {
+    char tmp[] = "\0";
+    ssize_t nw;
+    if (q->pipe_fd) {
+        nw = write(q->pipe_fd, tmp, 1);
+        q->pipe_fd = 0; /* only write once, zero pipe so we can't write again */
+        if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+    }
+}
+
 static void set_func(gpointer data, gpointer user_data) {
     (void)user_data;
     ib_err_t status;
-    ssize_t nw;
     query_t *q = (query_t *)data;
-    char tmp[] = "\0";
-
 
     ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
     ib_crsr_t crsr = NULL;
@@ -200,16 +207,13 @@ static void set_func(gpointer data, gpointer user_data) {
     if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
 
 done:
-    nw = write(q->pipe_fd, tmp, 1);
-    if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+    notify_pipe(q);
 }
 
 static void get_func(gpointer data, gpointer user_data) {
     (void)user_data;
     ib_err_t status;
-    ssize_t nw;
     query_t *q = (query_t *)data;
-    char tmp[] = "\0";
 
     ib_trx_t trx = ib_trx_begin(IB_TRX_REPEATABLE_READ);
     ib_crsr_t crsr = NULL;
@@ -263,8 +267,7 @@ static void get_func(gpointer data, gpointer user_data) {
     if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
 
 done:
-    nw = write(q->pipe_fd, tmp, 1);
-    if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+    notify_pipe(q);
 }
 
 static void *handle_connection(void *arg) {
