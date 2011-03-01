@@ -324,6 +324,10 @@ static void *handle_connection(void *arg) {
             } else {
                 g_error("error pushing work to thread pool");
             }
+        } else {
+            g_strfreev(args);
+            g_slice_free(query_t, q);
+            goto done;
         }
         g_strfreev(args);
         ssize_t nw = st_write(nfd, q->buf, q->len, ST_UTIME_NO_TIMEOUT);
@@ -332,6 +336,8 @@ static void *handle_connection(void *arg) {
     }
 done:
     g_message("closing client");
+    close(pipes[0]);
+    close(pipes[1]);
     st_netfd_close(nfd);
     return NULL;
 }
