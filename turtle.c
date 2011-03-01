@@ -115,13 +115,14 @@ typedef struct query_s query_t;
 static void notify_pipe(query_t *q) {
     char tmp[] = "\0";
     ssize_t nw;
-    if (q->pipe_fd != -1) {
-        nw = write(q->pipe_fd, tmp, 1);
-        q->pipe_fd = -1; /* only write once, zero pipe so we can't write again */
-        if (nw != 1) { g_error("error writing to pipe_fd: %zd", nw); }
-    } else {
-        g_warning("notify_pipe fd invalid");
-    }
+    nw = write(q->pipe_fd, tmp, 1);
+    if (nw != 1) { g_error("error writing to pipe_fd: %zd", nw); }
+}
+
+static void wait_pipe(st_netfd_t nfd) {
+    char tmp[1];
+    ssize_t nr = st_read(nfd, tmp, sizeof(tmp), ST_UTIME_NO_TIMEOUT);
+    g_assert(nr == 1);
 }
 
 static void set_func(gpointer data, gpointer user_data) {
@@ -234,8 +235,7 @@ static void get_func(gpointer data, gpointer user_data) {
 
     int res = 0;
     status = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
-    //if (res != -1) { g_error("key (%s) not found: %d", args[1], res); goto done; }
-    if (status == DB_SUCCESS) {
+    if (status == DB_SUCCESS && res == 0) {
         ib_tpl_t old_tpl = NULL;
 
         old_tpl = ib_clust_read_tuple_create(crsr);
@@ -244,16 +244,22 @@ static void get_func(gpointer data, gpointer user_data) {
         status = ib_cursor_read_row(crsr, old_tpl);
         if (status != DB_SUCCESS) { handle_ib_error(status); goto done; }
 
-        ib_ulint_t len = ib_col_get_len(old_tpl, 1);
-        const char *val = ib_col_get_value(old_tpl, 1);
+        ib_ulint_t klen = ib_col_get_len(old_tpl, 0);
+        const char *key = ib_col_get_value(old_tpl, 0);
+        if (key == NULL) { goto done; }
+        key = strndup(key, klen);
 
+        ib_ulint_t vlen = ib_col_get_len(old_tpl, 1);
+        const char *val = ib_col_get_value(old_tpl, 1);
         if (val == NULL) { goto done; }
-        val = strndup(val, len);
-        q->len = snprintf(q->buf, 1024, "GET %s %s\n", q->args[1], val);
+        val = strndup(val, vlen);
+
+        q->len = snprintf(q->buf, 1024, "GET %s %s\n", key, val);
+        free((char *)key);
         free((char *)val);
 
         ib_tuple_delete(old_tpl);
-    } else if (status == DB_END_OF_INDEX) {
+    } else if (status == DB_END_OF_INDEX || res == -1) {
         g_warning("key (%s) not found", q->args[1]);
     } else {
         handle_ib_error(status);
@@ -295,6 +301,8 @@ static void *handle_connection(void *arg) {
         q->pipe_fd = pipes[1];
         q->len = nr;
 
+        g_assert(q->pipe_fd != -1);
+
         if (g_strcmp0("SET", args[0]) == 0) {
             if (g_strv_length(q->args) < 3) {
                 goto done;
@@ -303,9 +311,7 @@ static void *handle_connection(void *arg) {
             GError *err = NULL;
             g_thread_pool_push(wpool, q, &err);
             if (err == NULL) {
-                char tmp[1];
-                ssize_t nr = st_read(p_nfd, tmp, sizeof(tmp), ST_UTIME_NO_TIMEOUT);
-                g_assert(nr == 1);
+                wait_pipe(p_nfd);
             } else {
                 g_error("error pushing work to thread pool");
             }
@@ -314,9 +320,7 @@ static void *handle_connection(void *arg) {
             GError *err = NULL;
             g_thread_pool_push(rpool, q, &err);
             if (err == NULL) {
-                char tmp[1];
-                ssize_t nr = st_read(p_nfd, tmp, sizeof(tmp), ST_UTIME_NO_TIMEOUT);
-                g_assert(nr == 1);
+                wait_pipe(p_nfd);
             } else {
                 g_error("error pushing work to thread pool");
             }
