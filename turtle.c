@@ -115,10 +115,12 @@ typedef struct query_s query_t;
 static void notify_pipe(query_t *q) {
     char tmp[] = "\0";
     ssize_t nw;
-    if (q->pipe_fd) {
+    if (q->pipe_fd != -1) {
         nw = write(q->pipe_fd, tmp, 1);
-        q->pipe_fd = 0; /* only write once, zero pipe so we can't write again */
-        if (nw != 1) { g_error("error writing to pipe_fd: %d", nw); }
+        q->pipe_fd = -1; /* only write once, zero pipe so we can't write again */
+        if (nw != 1) { g_error("error writing to pipe_fd: %zd", nw); }
+    } else {
+        g_warning("notify_pipe fd invalid");
     }
 }
 
